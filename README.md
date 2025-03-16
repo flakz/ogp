@@ -1,1 +1,1 @@
-# ogp
+Read > requirements.txt
