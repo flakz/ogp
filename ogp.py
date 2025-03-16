@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+import time
+import traceback
 from typing import Dict, List, Optional, Any
 from aiohttp import web
 
@@ -22,9 +24,7 @@ logger = logging.getLogger(__name__)
 AWAITING_TOKENS = 0
 POSITION_URL = "https://ceremony-backend.silentprotocol.org/ceremony/position"
 PING_URL = "https://ceremony-backend.silentprotocol.org/ceremony/ping"
-REQUEST_TIMEOUT = 30
-MAX_RETRIES = 2
-RETRY_DELAY = 5
+REQUEST_TIMEOUT = 25
 MONITOR_INTERVAL = 300  # 5 minutes
 
 # Storage
@@ -32,13 +32,13 @@ user_tokens: Dict[int, List[str]] = {}
 monitoring_tasks: Dict[int, asyncio.Task] = {}
 status_history: Dict[int, Dict[str, Any]] = {}
 
-# Async HTTP Server
+# Web Server Setup
 async def health_handler(request):
     return web.Response(text="OK")
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get("/health", health_handler)
+    app.router.add_get('/health', health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     
@@ -46,15 +46,59 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     
-    logger.info(f"HTTP server running on port {port}")
+    logger.info(f"Health server running on port {port}")
     return runner
 
-# Callback prefixes
-REMOVE_PREFIX = "remove_"
-INFO_PREFIX = "info_"
+def format_token(token: str) -> str:
+    return f"...{token[-6:]}" if len(token) > 6 else token
 
+def get_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "*/*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+
+# Core API Handlers (Simplified from old code)
+async def get_position(token: str) -> Optional[Dict]:
+    """Get position information"""
+    ts = format_token(token)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                POSITION_URL,
+                headers=get_headers(token),
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                logger.warning(f"[{ts}] Position error: HTTP {response.status}")
+                return None
+    except Exception as e:
+        logger.error(f"[{ts}] Position error: {str(e)}")
+        return None
+
+async def ping_server(token: str) -> Optional[Dict]:
+    """Ping server (simplified from old code)"""
+    ts = format_token(token)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                PING_URL,
+                headers=get_headers(token),
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                logger.warning(f"[{ts}] Ping error: HTTP {response.status}")
+                return None
+    except Exception as e:
+        logger.error(f"[{ts}] Ping error: {str(e)}")
+        return None
+
+# Bot Handlers (remain unchanged)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Initialize the main menu."""
+    """Initialize main menu"""
     keyboard = [
         [
             InlineKeyboardButton("Tokens", callback_data="tokens"),
@@ -73,7 +117,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    """Process inline keyboard interactions."""
+    """Process inline keyboard interactions"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -100,13 +144,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await stop_monitoring(query, user_id)
     elif query.data == "about":
         await show_about(query)
-    elif query.data.startswith((REMOVE_PREFIX, INFO_PREFIX)):
+    elif query.data.startswith(("remove_", "info_")):
         await handle_token_actions(query, user_id)
     
     return ConversationHandler.END
 
 async def show_token_menu(query: Any) -> None:
-    """Display token management interface."""
+    """Display token management interface"""
     menu = InlineKeyboardMarkup([
         [InlineKeyboardButton("Add Tokens", callback_data="add_tokens"),
          InlineKeyboardButton("Remove Tokens", callback_data="remove_tokens"),
@@ -116,60 +160,60 @@ async def show_token_menu(query: Any) -> None:
     await query.edit_message_text("🔑 Token Management", reply_markup=menu)
 
 async def show_remove_menu(query: Any, user_id: int) -> None:
-    """Show token removal menu."""
+    """Show token removal menu"""
     tokens = user_tokens.get(user_id, [])
     if not tokens:
         await query.edit_message_text("❌ No tokens to remove")
         return
     
     keyboard = [
-        [InlineKeyboardButton(f"Remove ...{token[-6:]}", callback_data=f"{REMOVE_PREFIX}{i}")]
+        [InlineKeyboardButton(f"Remove {format_token(token)}", callback_data=f"remove_{i}")]
         for i, token in enumerate(tokens)
     ]
     keyboard.append([InlineKeyboardButton("Back", callback_data="tokens")])
     await query.edit_message_text("Select token to remove:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_info_menu(query: Any, user_id: int) -> None:
-    """Show token info menu."""
+    """Show token info menu"""
     tokens = user_tokens.get(user_id, [])
     if not tokens:
         await query.edit_message_text("❌ No tokens to view")
         return
     
     keyboard = [
-        [InlineKeyboardButton(f"Info ...{token[-6:]}", callback_data=f"{INFO_PREFIX}{i}")]
+        [InlineKeyboardButton(f"Info {format_token(token)}", callback_data=f"info_{i}")]
         for i, token in enumerate(tokens)
     ]
     keyboard.append([InlineKeyboardButton("Back", callback_data="tokens")])
     await query.edit_message_text("Select token to view:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_token_actions(query: Any, user_id: int) -> None:
-    """Handle token removal/info actions."""
+    """Handle token removal/info actions"""
     data = query.data
     tokens = user_tokens.get(user_id, [])
     
-    if data.startswith(REMOVE_PREFIX):
-        index = int(data[len(REMOVE_PREFIX):])
+    if data.startswith("remove_"):
+        index = int(data[len("remove_"):])
         if 0 <= index < len(tokens):
             removed = tokens.pop(index)
-            await query.edit_message_text(f"✅ Removed token: ...{removed[-6:]}")
+            await query.edit_message_text(f"✅ Removed token: {format_token(removed)}")
         else:
             await query.edit_message_text("❌ Invalid token selection")
             
-    elif data.startswith(INFO_PREFIX):
-        index = int(data[len(INFO_PREFIX):])
+    elif data.startswith("info_"):
+        index = int(data[len("info_"):])
         if 0 <= index < len(tokens):
             await show_token_info(query, tokens[index])
         else:
             await query.edit_message_text("❌ Invalid token selection")
 
 async def show_token_info(query: Any, token: str) -> None:
-    """Display token information."""
+    """Display token information"""
     ping = await ping_server(token)
     position = await get_position(token)
     
     text = [
-        f"🔐 Token: ...{token[-6:]}",
+        f"🔐 Token: {format_token(token)}",
         f"🟢 Status: {ping.get('status', 'unknown') if ping else 'unavailable'}",
         f"📌 Position: {position.get('behind', 'unknown') if position else 'unavailable'}"
     ]
@@ -179,7 +223,7 @@ async def show_token_info(query: Any, token: str) -> None:
     ]))
 
 async def process_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store submitted tokens."""
+    """Store submitted tokens"""
     user_id = update.effective_user.id
     tokens = [t.strip() for t in update.message.text.split('\n') if t.strip()]
     
@@ -195,7 +239,7 @@ async def process_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 async def fetch_positions(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Retrieve and display positions."""
+    """Retrieve and display positions"""
     if not user_tokens.get(user_id):
         await context.bot.send_message(user_id, "⚠️ No tokens registered")
         return
@@ -203,48 +247,17 @@ async def fetch_positions(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> N
     response = ["📊 Current Positions:"]
     for token in user_tokens[user_id]:
         position = await get_position(token)
-        display = f"...{token[-6:]}"
+        display = format_token(token)
         response.append(f"• {display}: {position.get('behind', 'Unavailable') if position else 'Error'}")
     
     await context.bot.send_message(user_id, "\n".join(response))
 
-async def get_position(token: str) -> Optional[Dict]:
-    """Fetch position data with retries."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
-                async with session.get(POSITION_URL, headers={"Authorization": f"Bearer {token}"}) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    logger.warning(f"Position attempt {attempt+1} failed for ...{token[-6:]}")
-        except Exception as e:
-            logger.warning(f"Position error: {str(e)}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
-    return None
-
-async def ping_server(token: str) -> Optional[Dict]:
-    """Check server status with retries."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
-                async with session.get(PING_URL, headers={"Authorization": f"Bearer {token}"}) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    logger.warning(f"Ping attempt {attempt+1} failed for ...{token[-6:]}")
-        except Exception as e:
-            logger.warning(f"Ping error: {str(e)}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
-    return None
-
 async def start_monitoring(query: Any, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Start monitoring service."""
+    """Start monitoring service"""
     if user_id in monitoring_tasks and not monitoring_tasks[user_id].done():
         await query.edit_message_text("🔔 Monitoring already running")
         return
     
-    # Initialize status history
     status_history[user_id] = {}
     
     monitoring_tasks[user_id] = asyncio.create_task(
@@ -253,7 +266,7 @@ async def start_monitoring(query: Any, context: ContextTypes.DEFAULT_TYPE, user_
     await query.edit_message_text("🚀 Started monitoring - updates every 5 minutes")
 
 async def stop_monitoring(query: Any, user_id: int) -> None:
-    """Stop monitoring service."""
+    """Stop monitoring service"""
     if user_id in monitoring_tasks:
         monitoring_tasks[user_id].cancel()
         del monitoring_tasks[user_id]
@@ -263,48 +276,52 @@ async def stop_monitoring(query: Any, user_id: int) -> None:
         await query.edit_message_text("❌ No active monitoring")
 
 async def monitor_tokens(bot: telegram.Bot, user_id: int) -> None:
-    """Continuous monitoring with status tracking."""
+    """Monitoring loop"""
     try:
         while True:
             updates = []
+            start_time = time.time()
+            
             for token in user_tokens.get(user_id, []):
                 try:
-                    current_ping = await ping_server(token)
-                    current_pos = await get_position(token)
+                    ping_data, position_data = await asyncio.gather(
+                        ping_server(token),
+                        get_position(token)
+                    )
                     
                     new_status = {
-                        "ping": current_ping.get("status", "unknown") if current_ping else "down",
-                        "position": current_pos.get("behind", "unknown") if current_pos else "unknown"
+                        "ping": ping_data.get("status", "down") if ping_data else "error",
+                        "position": position_data.get("behind", "unknown") if position_data else "error"
                     }
                     
-                    old_status = status_history[user_id].get(token)
+                    old_status = status_history.get(user_id, {}).get(token)
                     
-                    if old_status != new_status:
+                    if new_status != old_status:
                         updates.append(format_status(token, new_status))
-                        status_history[user_id][token] = new_status
+                        status_history.setdefault(user_id, {})[token] = new_status
                         
                 except Exception as e:
-                    logger.error(f"Monitoring error for {token[-6:]}: {str(e)}")
-                    continue
-                
+                    logger.error(f"Monitoring error: {traceback.format_exc()}")
+
             if updates:
                 await bot.send_message(
                     user_id,
                     "🔄 Status Update:\n" + "\n".join(updates),
                     parse_mode="Markdown"
                 )
-            
-            await asyncio.sleep(MONITOR_INTERVAL)
+
+            elapsed = time.time() - start_time
+            await asyncio.sleep(max(MONITOR_INTERVAL - elapsed, 1))
             
     except asyncio.CancelledError:
         logger.info(f"Monitoring stopped for {user_id}")
     except Exception as e:
-        logger.error(f"Monitoring failure: {str(e)}")
-        await bot.send_message(user_id, "❌ Monitoring suspended due to errors")
+        logger.error(f"Critical failure: {traceback.format_exc()}")
+        await bot.send_message(user_id, "❌ Monitoring crashed - restart required")
 
 def format_status(token: str, status: Dict) -> str:
-    """Format status information."""
-    short_token = f"...{token[-6:]}" if len(token) > 6 else token
+    """Format status information"""
+    short_token = format_token(token)
     return (
         f"• *{short_token}*:\n"
         f"  Status: `{status['ping'].capitalize()}`\n"
@@ -312,11 +329,11 @@ def format_status(token: str, status: Dict) -> str:
     )
 
 async def return_to_main(query: Any) -> None:
-    """Return to main menu."""
+    """Return to main menu"""
     await start(query, None)
 
 async def show_about(query: Any) -> None:
-    """Show about information."""
+    """Show about information"""
     await query.edit_message_text(
         "🤖 Silent Protocol Monitor Bot\n\n"
         "Track your ceremony participation status\n"
@@ -325,12 +342,12 @@ async def show_about(query: Any) -> None:
     )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel current operation."""
+    """Cancel current operation"""
     await update.message.reply_text("❌ Operation cancelled")
     return ConversationHandler.END
 
 def get_token_menu_markup() -> InlineKeyboardMarkup:
-    """Generate token menu markup."""
+    """Generate token menu markup"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Add Tokens", callback_data="add_tokens"),
          InlineKeyboardButton("Remove Tokens", callback_data="remove_tokens"),
@@ -339,7 +356,7 @@ def get_token_menu_markup() -> InlineKeyboardMarkup:
     ])
 
 def get_main_menu_markup() -> InlineKeyboardMarkup:
-    """Generate main menu markup."""
+    """Generate main menu markup"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Tokens", callback_data="tokens"),
          InlineKeyboardButton("Position", callback_data="position")],
@@ -349,19 +366,19 @@ def get_main_menu_markup() -> InlineKeyboardMarkup:
     ])
 
 def main() -> None:
-    """Initialize and run the bot."""
+    """Main application entry point"""
     loop = asyncio.get_event_loop()
     
     try:
-        # Start web server
+        # Start services
         web_server = loop.run_until_complete(start_web_server())
         
-        # Get token from environment variable
+        # Validate configuration
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not bot_token:
-            raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
+            raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable")
 
-        # Create and configure bot
+        # Configure bot application
         application = Application.builder().token(bot_token).build()
         
         # Set up conversation handler
@@ -377,15 +394,14 @@ def main() -> None:
         application.add_handler(conv_handler)
         application.add_handler(CallbackQueryHandler(handle_button_click))
         
-        logger.info("Starting bot...")
+        logger.info("Starting services...")
         application.run_polling()
         
     except KeyboardInterrupt:
-        logger.info("Shutting down gracefully...")
+        logger.info("Initiating graceful shutdown...")
     finally:
-        # Cleanup resources
         loop.run_until_complete(web_server.cleanup())
-        logger.info("Services stopped")
+        logger.info("All services stopped")
 
 if __name__ == "__main__":
     main()
