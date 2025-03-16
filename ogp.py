@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 from typing import Dict, List, Optional, Any
@@ -23,7 +24,7 @@ PING_URL = "https://ceremony-backend.silentprotocol.org/ceremony/ping"
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAY = 5
-MONITOR_INTERVAL = 300
+MONITOR_INTERVAL = 300  # 5 minutes
 
 # Storage
 user_tokens: Dict[int, List[str]] = {}
@@ -183,7 +184,7 @@ async def fetch_positions(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> N
     response = ["📊 Current Positions:"]
     for token in user_tokens[user_id]:
         position = await get_position(token)
-        display = f"...{token[-6:]}" if len(token) > 6 else token
+        display = f"...{token[-6:]}"
         response.append(f"• {display}: {position.get('behind', 'Unavailable') if position else 'Error'}")
     
     await context.bot.send_message(user_id, "\n".join(response))
@@ -311,7 +312,12 @@ def get_main_menu_markup() -> InlineKeyboardMarkup:
 
 def main() -> None:
     """Initialize and run the bot."""
-    app = Application.builder().token("7818195044:AAHKD18hDQm8mpjTrBID7N_1Wj11NFcsAZY").build()
+    # Get token from environment variable
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
+
+    app = Application.builder().token(bot_token).build()
     
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_button_click, pattern="^add_tokens$")],
