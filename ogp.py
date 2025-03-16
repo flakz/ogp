@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 from typing import Dict, List, Optional, Any
+from threading import Thread
+from flask import Flask
 
 import aiohttp
 import telegram
@@ -22,13 +24,23 @@ AWAITING_TOKENS = 0
 POSITION_URL = "https://ceremony-backend.silentprotocol.org/ceremony/position"
 PING_URL = "https://ceremony-backend.silentprotocol.org/ceremony/ping"
 REQUEST_TIMEOUT = 30
-MAX_RETRIES = 3
+MAX_RETRIES = 2
 RETRY_DELAY = 5
 MONITOR_INTERVAL = 300  # 5 minutes
 
 # Storage
 user_tokens: Dict[int, List[str]] = {}
 monitoring_tasks: Dict[int, asyncio.Task] = {}
+status_history: Dict[int, Dict[str, Any]] = {}
+
+# Flask app for health checks
+app = Flask(__name__)
+@app.route('/health')
+def health_check():
+    return "OK", 200
+
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
 
 # Callback prefixes
 REMOVE_PREFIX = "remove_"
@@ -197,7 +209,9 @@ async def get_position(token: str) -> Optional[Dict]:
                 async with session.get(POSITION_URL, headers={"Authorization": f"Bearer {token}"}) as response:
                     if response.status == 200:
                         return await response.json()
+                    logger.warning(f"Position attempt {attempt+1} failed for ...{token[-6:]}")
         except Exception as e:
+            logger.warning(f"Position error: {str(e)}")
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY)
     return None
@@ -210,7 +224,9 @@ async def ping_server(token: str) -> Optional[Dict]:
                 async with session.get(PING_URL, headers={"Authorization": f"Bearer {token}"}) as response:
                     if response.status == 200:
                         return await response.json()
+                    logger.warning(f"Ping attempt {attempt+1} failed for ...{token[-6:]}")
         except Exception as e:
+            logger.warning(f"Ping error: {str(e)}")
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY)
     return None
@@ -221,7 +237,12 @@ async def start_monitoring(query: Any, context: ContextTypes.DEFAULT_TYPE, user_
         await query.edit_message_text("🔔 Monitoring already running")
         return
     
-    monitoring_tasks[user_id] = asyncio.create_task(monitor_tokens(context.bot, user_id))
+    # Initialize status history
+    status_history[user_id] = {}
+    
+    monitoring_tasks[user_id] = asyncio.create_task(
+        monitor_tokens(context.bot, user_id)
+    )
     await query.edit_message_text("🚀 Started monitoring - updates every 5 minutes")
 
 async def stop_monitoring(query: Any, user_id: int) -> None:
@@ -229,32 +250,42 @@ async def stop_monitoring(query: Any, user_id: int) -> None:
     if user_id in monitoring_tasks:
         monitoring_tasks[user_id].cancel()
         del monitoring_tasks[user_id]
+        del status_history[user_id]
         await query.edit_message_text("🛑 Stopped monitoring")
     else:
         await query.edit_message_text("❌ No active monitoring")
 
 async def monitor_tokens(bot: telegram.Bot, user_id: int) -> None:
     """Continuous monitoring with status tracking."""
-    prev_status = {}
-    
     try:
         while True:
             updates = []
             for token in user_tokens.get(user_id, []):
-                current_ping = await ping_server(token)
-                current_pos = await get_position(token)
+                try:
+                    current_ping = await ping_server(token)
+                    current_pos = await get_position(token)
+                    
+                    new_status = {
+                        "ping": current_ping.get("status", "unknown") if current_ping else "down",
+                        "position": current_pos.get("behind", "unknown") if current_pos else "unknown"
+                    }
+                    
+                    old_status = status_history[user_id].get(token)
+                    
+                    if old_status != new_status:
+                        updates.append(format_status(token, new_status))
+                        status_history[user_id][token] = new_status
+                        
+                except Exception as e:
+                    logger.error(f"Monitoring error for {token[-6:]}: {str(e)}")
+                    continue
                 
-                status = {
-                    "ping": current_ping.get("status") if current_ping else "down",
-                    "position": current_pos.get("behind") if current_pos else None
-                }
-                
-                if prev_status.get(token) != status:
-                    updates.append(format_status(token, status))
-                    prev_status[token] = status
-            
             if updates:
-                await bot.send_message(user_id, "🔄 Status Update:\n" + "\n".join(updates))
+                await bot.send_message(
+                    user_id,
+                    "🔄 Status Update:\n" + "\n".join(updates),
+                    parse_mode="Markdown"
+                )
             
             await asyncio.sleep(MONITOR_INTERVAL)
             
@@ -268,9 +299,9 @@ def format_status(token: str, status: Dict) -> str:
     """Format status information."""
     short_token = f"...{token[-6:]}" if len(token) > 6 else token
     return (
-        f"• {short_token}:\n"
-        f"  Status: {status['ping'].capitalize()}\n"
-        f"  Position: {status['position'] or 'Unknown'}"
+        f"• *{short_token}*:\n"
+        f"  Status: `{status['ping'].capitalize()}`\n"
+        f"  Position: `{status['position']}`"
     )
 
 async def return_to_main(query: Any) -> None:
@@ -312,6 +343,9 @@ def get_main_menu_markup() -> InlineKeyboardMarkup:
 
 def main() -> None:
     """Initialize and run the bot."""
+    # Start Flask server in a separate thread
+    Thread(target=run_flask).start()
+    
     # Get token from environment variable
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
