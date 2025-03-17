@@ -25,8 +25,7 @@ PING_URL = "https://ceremony-backend.silentprotocol.org/ceremony/ping"
 
 # Storage
 user_tokens: Dict[int, List[str]] = {}
-monitoring_tasks: Dict[int, asyncio.Task] = {}
-status_history: Dict[int, Dict[str, Any]] = {}
+monitoring_tasks: Dict[int, List[asyncio.Task]] = {}
 
 
 # Web Server Setup
@@ -64,14 +63,14 @@ def get_headers(token: str) -> Dict[str, str]:
 
 
 async def get_position(token: str) -> Optional[Dict]:
-    """Exact replica of old code's position check"""
+    """Get position with infinite timeout"""
     ts = format_token(token)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                     POSITION_URL,
                     headers=get_headers(token),
-                    timeout=None  # No timeout
+                    timeout=None  # Infinite timeout
             ) as response:
                 if response.status == 200:
                     return await response.json()
@@ -84,14 +83,14 @@ async def get_position(token: str) -> Optional[Dict]:
 
 
 async def ping_server(token: str) -> Optional[Dict]:
-    """Exact replica of old code's ping check"""
+    """Ping server with infinite timeout"""
     ts = format_token(token)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                     PING_URL,
                     headers=get_headers(token),
-                    timeout=None  # No timeout
+                    timeout=None  # Infinite timeout
             ) as response:
                 if response.status == 200:
                     return await response.json()
@@ -100,6 +99,33 @@ async def ping_server(token: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"[{ts}] Ping error: {str(e)}")
         return None
+
+
+async def monitor_token(bot: telegram.Bot, user_id: int, token: str) -> None:
+    """Continuous monitoring for a single token"""
+    try:
+        while True:
+            ping_data = await ping_server(token)
+            position_data = await get_position(token)
+
+            status = (
+                f"• *{format_token(token)}*:\n"
+                f"  Status: `{ping_data.get('status', 'N/A') if ping_data else 'Error'}`\n"
+                f"  Position: `{position_data.get('behind', 'N/A') if position_data else 'Error'}`"
+            )
+
+            await bot.send_message(user_id,
+                                   f"🔄 Status Update:\n{status}",
+                                   parse_mode="Markdown")
+
+    except asyncio.CancelledError:
+        logger.info(f"Monitoring stopped for token {format_token(token)}")
+    except Exception as e:
+        logger.error(f"Critical failure: {traceback.format_exc()}")
+        await bot.send_message(
+            user_id,
+            f"❌ Monitoring crashed for {format_token(token)} - restart required"
+        )
 
 
 # Bot Handlers
@@ -269,74 +295,27 @@ async def fetch_positions(context: ContextTypes.DEFAULT_TYPE,
 
 async def start_monitoring(query: Any, context: ContextTypes.DEFAULT_TYPE,
                            user_id: int) -> None:
-    if user_id in monitoring_tasks and not monitoring_tasks[user_id].done():
+    if user_id in monitoring_tasks:
         await query.edit_message_text("🔔 Monitoring already running")
         return
 
-    status_history[user_id] = {}
+    monitoring_tasks[user_id] = []
+    for token in user_tokens.get(user_id, []):
+        task = asyncio.create_task(monitor_token(context.bot, user_id, token))
+        monitoring_tasks[user_id].append(task)
 
-    monitoring_tasks[user_id] = asyncio.create_task(
-        monitor_tokens(context.bot, user_id))
     await query.edit_message_text(
-        "🚀 Started monitoring - updates every 5 minutes")
+        "🚀 Started continuous monitoring for all tokens")
 
 
 async def stop_monitoring(query: Any, user_id: int) -> None:
     if user_id in monitoring_tasks:
-        monitoring_tasks[user_id].cancel()
+        for task in monitoring_tasks[user_id]:
+            task.cancel()
         del monitoring_tasks[user_id]
-        del status_history[user_id]
         await query.edit_message_text("🛑 Stopped monitoring")
     else:
         await query.edit_message_text("❌ No active monitoring")
-
-
-async def monitor_tokens(bot: telegram.Bot, user_id: int) -> None:
-    try:
-        while True:
-            updates = []
-            start_time = time.time()
-
-            for token in user_tokens.get(user_id, []):
-                ping_data = await ping_server(token)
-                position_data = await get_position(token)
-
-                new_status = {
-                    "ping":
-                    ping_data.get("status", "N/A") if ping_data else "Error",
-                    "position":
-                    position_data.get("behind", "N/A")
-                    if position_data else "Error"
-                }
-
-                old_status = status_history.get(user_id, {}).get(token)
-
-                if new_status != old_status:
-                    updates.append(format_status(token, new_status))
-                    status_history.setdefault(user_id, {})[token] = new_status
-
-            if updates:
-                await bot.send_message(user_id,
-                                       "🔄 Status Update:\n" +
-                                       "\n".join(updates),
-                                       parse_mode="Markdown")
-
-            elapsed = time.time() - start_time
-            await asyncio.sleep(max(300 - elapsed, 1))
-
-    except asyncio.CancelledError:
-        logger.info(f"Monitoring stopped for {user_id}")
-    except Exception as e:
-        logger.error(f"Critical failure: {traceback.format_exc()}")
-        await bot.send_message(user_id,
-                               "❌ Monitoring crashed - restart required")
-
-
-def format_status(token: str, status: Dict) -> str:
-    short_token = format_token(token)
-    return (f"• *{short_token}*:\n"
-            f"  Status: `{status['ping']}`\n"
-            f"  Position: `{status['position']}`")
 
 
 async def return_to_main(query: Any) -> None:
